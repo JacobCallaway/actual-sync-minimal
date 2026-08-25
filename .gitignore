@@ -7,6 +7,6 @@ node_modules/
 actual-sync
 .pnpm-store/
 package-lock.json
-sync.log
+sync.log*
 .DS_Store
 ._*
