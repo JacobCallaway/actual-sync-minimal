@@ -135,6 +135,15 @@ const STYLES = `
     font-family: ui-monospace, monospace; font-size: 0.75rem; white-space: pre-wrap; word-break: break-word;
     max-height: 320px; overflow-y: auto; color: #cbd5e1;
   }
+  .sync-panel { display: flex; flex-direction: column; gap: 1rem; }
+  .sync-panel[hidden] { display: none; }
+  .sync-head { display: flex; align-items: center; gap: 0.6rem; }
+  .sync-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); flex: none; }
+  .sync-dot.running { background: var(--accent-primary); animation: syncPulse 1.2s ease-in-out infinite; }
+  .sync-dot.success { background: var(--accent-success); }
+  .sync-dot.failed  { background: var(--accent-error); }
+  @keyframes syncPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.8); } }
+  @media (prefers-reduced-motion: reduce) { .sync-dot.running { animation: none; } }
   .toast {
     position: fixed; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
     padding: 0.8rem 1.3rem; border-radius: 10px; font-size: 0.87rem; z-index: 1200;
@@ -630,28 +639,82 @@ const showReconcileResult = (report) => {
 
 // -------------------------------------------------------------------- sync
 
+let syncTimer = null;
+let syncRunning = false;
+
+const BADGE_FOR = {
+  running: ["badge-warning", "Running"],
+  success: ["badge-success", "Finished"],
+  failed:  ["badge-error",   "Failed"],
+};
+
+/** Paint the inline panel. Kept out of render() so the log survives tab
+ * switches and re-renders. */
+const setSync = (status, logs) => {
+  $("syncDot").className = "sync-dot " + status;
+  const [cls, text] = BADGE_FOR[status] || ["badge-neutral", "Idle"];
+  $("syncBadge").className = "badge " + cls;
+  $("syncBadge").textContent = text;
+  if (logs != null) {
+    const log = $("syncLog");
+    // Only stick to the bottom if the user has not scrolled up to read.
+    const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    log.textContent = logs;
+    if (pinned) log.scrollTop = log.scrollHeight;
+  }
+  const btn = document.querySelector("[data-run-sync]");
+  if (btn) {
+    btn.disabled = status === "running";
+    btn.textContent = status === "running" ? "Syncing…" : "Run sync";
+  }
+};
+
+window.toggleSyncLog = () => {
+  const log = $("syncLog");
+  const hidden = log.style.display === "none";
+  log.style.display = hidden ? "" : "none";
+  $("syncToggle").textContent = hidden ? "Hide log" : "Show log";
+};
+
+window.dismissSync = () => {
+  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+  syncRunning = false;
+  setSync("idle", "");
+  $("syncPanel").hidden = true;
+};
+
 window.runSync = async () => {
-  showModal("<h2>Running sync</h2><pre class=\"log\" id=\"syncLog\">Starting…</pre>" +
-    '<div class="row-actions"><button class="btn ghost" onclick="closeModal()">Close</button></div>');
+  if (syncRunning) return;
+  syncRunning = true;
+  $("syncPanel").hidden = false;
+  $("syncLog").style.display = "";
+  $("syncToggle").textContent = "Hide log";
+  setSync("running", "Starting sync…\n");
+  $("syncPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+
   try {
     const res = await api("/api/run", { method: "POST" });
-    const timer = setInterval(async () => {
-      if (!$("syncLog")) { clearInterval(timer); return; }
+    if (syncTimer) clearInterval(syncTimer);
+    syncTimer = setInterval(async () => {
       try {
         const d = await api("/api/logs/" + encodeURIComponent(res.job_id));
-        if (d.logs) {
-          $("syncLog").textContent = d.logs;
-          $("syncLog").scrollTop = $("syncLog").scrollHeight;
-        }
         if (d.status === "success" || d.status === "failed") {
-          clearInterval(timer);
-          toast(d.status === "success" ? "Sync finished." : "Sync failed — see the log.", d.status === "success" ? "ok" : "err");
+          clearInterval(syncTimer); syncTimer = null; syncRunning = false;
+          setSync(d.status, d.logs || "");
+          toast(d.status === "success" ? "Sync finished." : "Sync failed — see the log.",
+                d.status === "success" ? "ok" : "err");
           await load();
+        } else {
+          setSync("running", d.logs || "Waiting for the sync to start…\n");
         }
-      } catch (e) { clearInterval(timer); }
+      } catch (e) {
+        clearInterval(syncTimer); syncTimer = null; syncRunning = false;
+        setSync("failed", ($("syncLog").textContent || "") + "\nLost contact with the server: " + e.message);
+      }
     }, 1500);
   } catch (e) {
-    if ($("syncLog")) $("syncLog").textContent = "Could not start sync: " + e.message;
+    syncRunning = false;
+    setSync("failed", "Could not start sync: " + e.message);
   }
 };
 
@@ -710,9 +773,23 @@ export const renderDashboardApp = (): string => `<!DOCTYPE html>
       </div>
       <div class="row-actions">
         <div class="tabs" id="tabs"></div>
-        <button class="btn" onclick="runSync()">Run sync</button>
+        <button class="btn" data-run-sync onclick="runSync()">Run sync</button>
       </div>
     </header>
+    <section id="syncPanel" class="card sync-panel" hidden>
+      <div class="card-head">
+        <div class="sync-head">
+          <span id="syncDot" class="sync-dot"></span>
+          <h2>Sync</h2>
+          <span id="syncBadge" class="badge badge-neutral">Idle</span>
+        </div>
+        <div class="row-actions">
+          <button class="btn ghost" id="syncToggle" onclick="toggleSyncLog()">Hide log</button>
+          <button class="btn ghost" onclick="dismissSync()">Dismiss</button>
+        </div>
+      </div>
+      <pre class="log" id="syncLog"></pre>
+    </section>
     <div id="view"></div>
   </div>
   <div id="toast" class="toast" style="display:none"></div>
