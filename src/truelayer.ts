@@ -34,6 +34,18 @@ export type ConnectionRef = {
   accessTokenExpiresAt?: string;
 };
 
+/** What TrueLayer reports about a consent itself, as opposed to the accounts
+ * it covers. This is authoritative — expiry must never be guessed from a
+ * blanket duration, because it varies by provider and by when consent was
+ * granted. */
+export type ConsentInfo = {
+  credentialsId?: string;
+  providerName?: string;
+  consentStatus?: string;
+  consentCreatedAt?: string;
+  consentExpiresAt?: string;
+};
+
 /** An account discovered at TrueLayer, before it is reconciled into state. */
 export type DiscoveredAccount = {
   id: string;
@@ -227,11 +239,48 @@ export const Truelayer = (
     );
   };
 
+  /** Read the consent behind a connection: who granted it, when, and when it
+   * lapses. Returns null if the provider does not expose it. */
+  const getConsent = async (
+    auth: ConnectionRef | { accessToken: string },
+  ): Promise<ConsentInfo | null> => {
+    type MeResponse = {
+      credentials_id?: string;
+      consent_status?: string;
+      consent_created_at?: string;
+      consent_expires_at?: string;
+      provider?: { display_name?: string };
+    };
+    const data = await truelayerApi<MeResponse>("/data/v1/me", auth);
+    const result = data?.results?.[0];
+    if (!result) return null;
+    return {
+      ...(result.credentials_id ? { credentialsId: result.credentials_id } : {}),
+      ...(result.provider?.display_name
+        ? { providerName: result.provider.display_name }
+        : {}),
+      ...(result.consent_status ? { consentStatus: result.consent_status } : {}),
+      ...(result.consent_created_at
+        ? { consentCreatedAt: result.consent_created_at }
+        : {}),
+      ...(result.consent_expires_at
+        ? { consentExpiresAt: result.consent_expires_at }
+        : {}),
+    };
+  };
+
   /** Exchange an authorization code for tokens and the accounts they unlock. */
   const completeAuth = async (
     code: string,
-  ): Promise<{ tokens: Tokens; accounts: DiscoveredAccount[] }> => {
+  ): Promise<{
+    tokens: Tokens;
+    accounts: DiscoveredAccount[];
+    consent: ConsentInfo | null;
+  }> => {
     const tokens = await swapCodeForTokens(code);
+    const consent = await getConsent({ accessToken: tokens.accessToken }).catch(
+      () => null,
+    );
     const accounts = await getInfo({ accessToken: tokens.accessToken });
     if (accounts.length === 0) {
       throw new Error(
@@ -239,7 +288,7 @@ export const Truelayer = (
           "Check that the consent covers at least one account or card.",
       );
     }
-    return { tokens, accounts };
+    return { tokens, accounts, consent };
   };
 
   const addAccounts = async (): Promise<TruelayerBankAccount[]> => {
@@ -287,6 +336,7 @@ export const Truelayer = (
     addAccounts,
     completeAuth,
     getAccounts: getInfo,
+    getConsent,
     getTransactions,
     getBalance,
     listAccounts,

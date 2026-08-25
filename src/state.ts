@@ -4,7 +4,9 @@ import * as path from "path";
 import { AppConfig } from "./config";
 import { TruelayerBankAccount } from "./truelayer";
 
-/** TrueLayer consent lasts 90 days from the moment it is granted. */
+/** Fallback consent length, used only when TrueLayer does not report a real
+ * expiry. The true value varies by provider and is read from /data/v1/me — do
+ * not rely on this constant for anything user-facing when a real date exists. */
 export const CONSENT_DURATION_DAYS = 90;
 /** A connection is flagged as "expiring" this many days before consent lapses. */
 export const EXPIRY_WARNING_DAYS = 7;

@@ -8,7 +8,7 @@ import {
   loadState,
   updateState,
 } from "./state";
-import { DiscoveredAccount, Tokens, Truelayer } from "./truelayer";
+import { ConsentInfo, DiscoveredAccount, Tokens, Truelayer } from "./truelayer";
 
 /** What changed when a connection's accounts were reconciled after a re-auth.
  * Surfaced to the user so an id change never happens silently. */
@@ -112,6 +112,36 @@ export const reconcileAccounts = (
   return report;
 };
 
+/** True when a label was auto-derived rather than chosen by the user, so it is
+ * safe to replace with the provider's real name. */
+const isAutoLabel = (connection: Connection): boolean =>
+  /^Bank \(\d+ accounts\)$/.test(connection.label) ||
+  connection.accounts.some((a) => a.name === connection.label);
+
+/** Record what TrueLayer says about the consent. Its expiry is authoritative;
+ * the 90-day fallback is only for providers that do not report one. */
+export const applyConsent = (
+  connection: Connection,
+  consent: ConsentInfo | null,
+) => {
+  if (!consent) return;
+  if (consent.consentCreatedAt) connection.connectedAt = consent.consentCreatedAt;
+  if (consent.consentExpiresAt) {
+    connection.consentExpiresAt = consent.consentExpiresAt;
+  } else if (consent.consentCreatedAt) {
+    connection.consentExpiresAt = consentExpiryFrom(consent.consentCreatedAt);
+  }
+  // The provider's own name beats a label derived from an account name.
+  if (consent.providerName && isAutoLabel(connection)) {
+    connection.label = consent.providerName;
+  }
+  const status = consent.consentStatus?.toLowerCase();
+  if (status && status !== "authorised" && status !== "authorized") {
+    connection.status = "expired";
+    connection.lastRefreshError = `TrueLayer reports consent status "${consent.consentStatus}"`;
+  }
+};
+
 /** Apply fresh tokens to a connection and clear the failure state that a
  * previous expiry left behind. */
 const applyTokens = (connection: Connection, tokens: Tokens) => {
@@ -135,7 +165,7 @@ export const completeConnection = async (
 ): Promise<{ connectionId: string; report: ReconcileReport }> => {
   const truelayer = Truelayer(config.truelayer);
   // Network first: nothing is written until we know the code was good.
-  const { tokens, accounts } = await truelayer.completeAuth(opts.code);
+  const { tokens, accounts, consent } = await truelayer.completeAuth(opts.code);
 
   return updateState(config, (state) => {
     const now = new Date().toISOString();
@@ -160,6 +190,7 @@ export const completeConnection = async (
         id: randomUUID(),
         label:
           opts.label ??
+          consent?.providerName ??
           (accounts.length === 1
             ? accounts[0]!.name
             : `Bank (${accounts.length} accounts)`),
@@ -176,6 +207,9 @@ export const completeConnection = async (
     connection.connectedAt = now;
     connection.consentExpiresAt = consentExpiryFrom(now);
     connection.status = "active";
+    // Overwrite the assumed dates with what TrueLayer actually reports.
+    applyConsent(connection, consent);
+    if (opts.label) connection.label = opts.label;
 
     const report = reconcileAccounts(connection, accounts, state.map);
     // The old access token belonged to the previous consent.
@@ -235,10 +269,15 @@ export const refreshAllAccounts = async (
   });
 
   const discovered = new Map<string, DiscoveredAccount[]>();
+  const consents = new Map<string, ConsentInfo | null>();
   const failures = new Map<string, string>();
 
   for (const connection of state.connections) {
     try {
+      consents.set(
+        connection.id,
+        await truelayer.getConsent(connection).catch(() => null),
+      );
       discovered.set(connection.id, await truelayer.getAccounts(connection));
     } catch (err) {
       failures.set(
@@ -254,6 +293,7 @@ export const refreshAllAccounts = async (
       const accounts = discovered.get(connection.id);
       if (accounts) {
         reports.push(reconcileAccounts(connection, accounts, fresh.map));
+        applyConsent(connection, consents.get(connection.id) ?? null);
         continue;
       }
       const failure = failures.get(connection.id);

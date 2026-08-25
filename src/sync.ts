@@ -7,7 +7,7 @@ import {
   TruelayerTransaction,
 } from "./truelayer";
 import { daysUntilExpiry, deriveStatus, loadState, updateState } from "./state";
-import { persistTokens } from "./connections";
+import { applyConsent, persistTokens } from "./connections";
 import * as YAML from "yaml";
 import { Ntfy } from "./ntfy";
 import * as fs from "fs";
@@ -982,6 +982,9 @@ export const Sync = (config: AppConfig) => {
       /** Connections whose key died mid-run. Collected rather than thrown so a
        * single expired bank cannot stop the healthy ones from syncing. */
       const expiredConnections = new Map<string, string>();
+      /** Consent metadata, fetched once per connection per run so the expiry
+       * countdown stays honest without anyone opening the dashboard. */
+      const consents = new Map<string, Awaited<ReturnType<typeof truelayer.getConsent>>>();
       const failures: { name: string; reason: string }[] = [];
 
       const dashboardDir = process.env.DASHBOARD_DATA_DIR || "/app/data";
@@ -1061,6 +1064,13 @@ export const Sync = (config: AppConfig) => {
             throw new Error(
               `Bank account ${mapping.truelayerAccountId} is not covered by the connection for "${mapping.name}". Reconnect it from the dashboard.`,
             );
+
+          if (!consents.has(connection.id)) {
+            consents.set(
+              connection.id,
+              await truelayer.getConsent(connection).catch(() => null),
+            );
+          }
 
           const truelayerTransactions = await truelayer.getTransactions(
             truelayerAccount,
@@ -1166,6 +1176,10 @@ export const Sync = (config: AppConfig) => {
             connection.status = "expired";
             connection.lastRefreshError = reason;
           }
+        }
+        for (const [id, consent] of consents) {
+          const connection = fresh.connections.find((c) => c.id === id);
+          if (connection) applyConsent(connection, consent ?? null);
         }
         if (fingerprint) fresh.actualCacheFingerprint = fingerprint;
         fresh.actualAccountsCache = {
