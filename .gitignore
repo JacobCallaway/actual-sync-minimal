@@ -1,5 +1,12 @@
 .config.yml
+.config.yml.bak*
+*.bak.*
 .cache/
+.data/
 node_modules/
 actual-sync
 .pnpm-store/
+package-lock.json
+sync.log
+.DS_Store
+._*

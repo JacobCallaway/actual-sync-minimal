@@ -6,6 +6,8 @@ import {
   TruelayerConnectionExpiredError,
   TruelayerTransaction,
 } from "./truelayer";
+import { daysUntilExpiry, deriveStatus, loadState, updateState } from "./state";
+import { persistTokens } from "./connections";
 import * as YAML from "yaml";
 import { Ntfy } from "./ntfy";
 import * as fs from "fs";
@@ -947,23 +949,41 @@ export const Sync = (config: AppConfig) => {
         tx.meta.provider_merchant_name ??
         tx.meta.counter_party_preferred_name ??
         tx.description,
-      cleared: false,
+      // Only settled transactions count as cleared. Providers that report no
+      // status at all are treated as settled, matching the old behaviour.
+      cleared: tx.transaction_status ? tx.transaction_status === "SETTLED" : true,
     };
   };
 
   const sync = async () => {
-    const actual = await openActualSession(config.actual);
+    const state = loadState(config);
+    const truelayer = Truelayer(config.truelayer, {
+      onTokens: (id, tokens) => persistTokens(config, id, tokens),
+    });
+
+    let fingerprint: string | undefined;
+    const actual = await openActualSession(config.actual, {
+      ...(state.actualCacheFingerprint
+        ? { previousFingerprint: state.actualCacheFingerprint }
+        : {}),
+      onFingerprint: (fp) => {
+        fingerprint = fp;
+      },
+    });
+
     try {
-      const truelayer = Truelayer(config.truelayer);
       const actualAccounts = await actual.listAccounts();
-      const truelayerAccounts = truelayer.listAccounts();
-      let syncResult = {
+      const syncResult = {
         accountSyncs: 0,
         newTransactions: 0,
         balanceMismatches: 0,
         mismatchedBanks: [] as string[],
       };
-      
+      /** Connections whose key died mid-run. Collected rather than thrown so a
+       * single expired bank cannot stop the healthy ones from syncing. */
+      const expiredConnections = new Map<string, string>();
+      const failures: { name: string; reason: string }[] = [];
+
       const dashboardDir = process.env.DASHBOARD_DATA_DIR || "/app/data";
       let existingDashboardData: any = null;
       try {
@@ -975,7 +995,7 @@ export const Sync = (config: AppConfig) => {
         // ignore errors
       }
 
-      let dashboardData = {
+      const dashboardData = {
         lastSyncTime: new Date().toISOString(),
         commitHash: process.env.GIT_COMMIT_HASH || "unknown",
         overall: {
@@ -983,119 +1003,195 @@ export const Sync = (config: AppConfig) => {
           newTransactions: 0,
           balanceMismatches: 0,
           mismatchedBanks: [] as string[],
+          failures: [] as { name: string; reason: string }[],
         },
+        connections: [] as any[],
         accounts: [] as any[],
       };
 
-      for (var syncConfig of config.sync.map) {
+      const enabled = state.map.filter((m) => m.enabled !== false);
+      if (enabled.length === 0) {
         console.log(
-          chalk.bold.bgYellow(`\nSync transactions for ${syncConfig.name}`),
+          chalk.yellow(
+            "No account mappings are configured. Add them in the dashboard, or run: actual-sync map add",
+          ),
         );
-        const actualAccount = actualAccounts.find(
-          (a) => a.id === syncConfig.actualAccountId,
-        );
-        const truelayerAccount = truelayerAccounts.find(
-          (a) => a.id === syncConfig.truelayerAccountId,
-        );
-        if (!actualAccount)
-          throw new Error(
-            `Actual account id ${syncConfig.actualAccountId} not found for bank "${syncConfig.name}". Check your sync config`,
-          );
-        if (!truelayerAccount)
-          throw new Error(
-            `Truelayer account id ${syncConfig.truelayerAccountId} not found for bank "${syncConfig.name}". Check your sync config`,
-          );
-        const truelayerTransactions = await truelayer
-          .getTransactions(truelayerAccount)
-          .catch((error) => {
-            if (error instanceof TruelayerConnectionExpiredError)
-              throw new TruelayerConnectionExpiredError(syncConfig.name);
-            throw new Error(
-              `Failed to get transactions for bank "${syncConfig.name}": ${error.message || error}`,
-            );
-          });
-        const actualTransactions = truelayerTransactions.map((t) =>
-          mapTx(t, syncConfig.actualAccountId, syncConfig.mapConfig),
-        );
-        const report = await actual.loadTransactions(
-          syncConfig.actualAccountId,
-          actualTransactions,
-        );
-        console.log(chalk.green("Sync result"));
-        console.log(YAML.stringify(report, null, 2));
-        // verify balances
-        const truelayerBalance = await truelayer
-          .getBalance(truelayerAccount)
-          .catch((error) => {
-            if (error instanceof TruelayerConnectionExpiredError)
-              throw new TruelayerConnectionExpiredError(syncConfig.name);
-            throw new Error(
-              `Failed to get balance for bank "${syncConfig.name}": ${error.message || error}`,
-            );
-          });
-        const actualBalance = await actual.getBalance(actualAccount.id);
-        const sign = truelayerAccount.type === "CARD" ? -1 : 1;
-        syncResult.newTransactions += report.added;
-        
-        const isMatch = truelayerBalance?.current === (actualBalance / 100) * sign;
-        
-        const existingAcc = existingDashboardData?.accounts?.find(
-          (a: any) => a.actualAccountId === syncConfig.actualAccountId
-        );
-        const existingHistory = existingAcc?.history || [];
-        
-        const currentHistoryEntry = {
-          timestamp: new Date().toISOString(),
-          added: report.added,
-          updated: report.updated,
-          updatedPreview: report.updatedPreview,
-          errors: report.errors,
-          balances: {
-            online: truelayerBalance?.current ?? 0,
-            actual: (actualBalance / 100) * sign,
-            match: isMatch
-          }
-        };
-
-        const accountHistory = [currentHistoryEntry, ...existingHistory].slice(0, 20);
-
-        dashboardData.accounts.push({
-          name: syncConfig.name,
-          truelayerAccountId: syncConfig.truelayerAccountId,
-          actualAccountId: syncConfig.actualAccountId,
-          added: report.added,
-          updated: report.updated,
-          errors: report.errors,
-          updatedPreview: report.updatedPreview,
-          balances: {
-            online: truelayerBalance?.current ?? 0,
-            actual: (actualBalance / 100) * sign,
-            match: isMatch,
-            currency: truelayerBalance?.currency || "GBP",
-          },
-          history: accountHistory
-        });
-
-        if (isMatch)
-          console.log(chalk.green(`Account balances match`));
-        else {
-          syncResult.balanceMismatches += 1;
-          syncResult.mismatchedBanks.push(syncConfig.name);
-          console.log(chalk.red(`Account balances DO NOT match`));
-          console.log(chalk.green("\nOnline balance"));
-          console.log(YAML.stringify(truelayerBalance, null, 2));
-          console.log(chalk.green("\nActual balance"));
-          console.log(actualBalance / 100);
-        }
-        syncResult.accountSyncs += 1;
       }
 
-      // Populate overall stats
+      for (const mapping of enabled) {
+        console.log(
+          chalk.bold.bgYellow(`\nSync transactions for ${mapping.name}`),
+        );
+
+        const connection = state.connections.find(
+          (c) => c.id === mapping.connectionId,
+        );
+
+        // Skip a bank we already know is dead rather than burning a failing
+        // token exchange for every one of its accounts.
+        if (connection && expiredConnections.has(connection.id)) {
+          console.log(
+            chalk.yellow(
+              `Skipped — the connection for "${connection.label}" has expired.`,
+            ),
+          );
+          failures.push({
+            name: mapping.name,
+            reason: `Connection "${connection.label}" has expired`,
+          });
+          continue;
+        }
+
+        try {
+          const actualAccount = actualAccounts.find(
+            (a) => a.id === mapping.actualAccountId,
+          );
+          const truelayerAccount = connection?.accounts.find(
+            (a) => a.id === mapping.truelayerAccountId,
+          );
+          if (!connection)
+            throw new Error(
+              `No bank connection found for "${mapping.name}". Reconnect it from the dashboard.`,
+            );
+          if (!actualAccount)
+            throw new Error(
+              `Actual account ${mapping.actualAccountId} not found for "${mapping.name}". Re-pick it in the dashboard.`,
+            );
+          if (!truelayerAccount)
+            throw new Error(
+              `Bank account ${mapping.truelayerAccountId} is not covered by the connection for "${mapping.name}". Reconnect it from the dashboard.`,
+            );
+
+          const truelayerTransactions = await truelayer.getTransactions(
+            truelayerAccount,
+            connection,
+          );
+          const actualTransactions = truelayerTransactions.map((t) =>
+            mapTx(t, mapping.actualAccountId, mapping.mapConfig ?? {}),
+          );
+          const report = await actual.loadTransactions(
+            mapping.actualAccountId,
+            actualTransactions,
+          );
+          console.log(chalk.green("Sync result"));
+          console.log(YAML.stringify(report, null, 2));
+
+          // verify balances
+          const truelayerBalance = await truelayer.getBalance(
+            truelayerAccount,
+            connection,
+          );
+          const actualBalance = await actual.getBalance(actualAccount.id);
+          const sign = truelayerAccount.type === "CARD" ? -1 : 1;
+          syncResult.newTransactions += report.added;
+
+          const isMatch =
+            truelayerBalance?.current === (actualBalance / 100) * sign;
+
+          const existingAcc = existingDashboardData?.accounts?.find(
+            (a: any) => a.actualAccountId === mapping.actualAccountId,
+          );
+          const existingHistory = existingAcc?.history || [];
+
+          const currentHistoryEntry = {
+            timestamp: new Date().toISOString(),
+            added: report.added,
+            updated: report.updated,
+            updatedPreview: report.updatedPreview,
+            errors: report.errors,
+            balances: {
+              online: truelayerBalance?.current ?? 0,
+              actual: (actualBalance / 100) * sign,
+              match: isMatch,
+            },
+          };
+
+          const accountHistory = [currentHistoryEntry, ...existingHistory].slice(
+            0,
+            20,
+          );
+
+          dashboardData.accounts.push({
+            name: mapping.name,
+            connectionId: mapping.connectionId,
+            truelayerAccountId: mapping.truelayerAccountId,
+            actualAccountId: mapping.actualAccountId,
+            added: report.added,
+            updated: report.updated,
+            errors: report.errors,
+            updatedPreview: report.updatedPreview,
+            balances: {
+              online: truelayerBalance?.current ?? 0,
+              actual: (actualBalance / 100) * sign,
+              match: isMatch,
+              currency: truelayerBalance?.currency || "GBP",
+            },
+            history: accountHistory,
+          });
+
+          if (isMatch) console.log(chalk.green(`Account balances match`));
+          else {
+            syncResult.balanceMismatches += 1;
+            syncResult.mismatchedBanks.push(mapping.name);
+            console.log(chalk.red(`Account balances DO NOT match`));
+            console.log(chalk.green("\nOnline balance"));
+            console.log(YAML.stringify(truelayerBalance, null, 2));
+            console.log(chalk.green("\nActual balance"));
+            console.log(actualBalance / 100);
+          }
+          syncResult.accountSyncs += 1;
+        } catch (error) {
+          const reason =
+            error instanceof Error ? error.message : String(error);
+          if (error instanceof TruelayerConnectionExpiredError && connection) {
+            expiredConnections.set(connection.id, reason);
+            console.error(
+              chalk.red(
+                `Connection for "${connection.label}" has expired — reconnect it from the dashboard. Continuing with the other accounts.`,
+              ),
+            );
+          } else {
+            console.error(chalk.red(`Failed to sync "${mapping.name}": ${reason}`));
+          }
+          failures.push({ name: mapping.name, reason });
+        }
+      }
+
+      // Persist everything the run learned: dead connections, and which budget
+      // the local cache now holds.
+      await updateState(config, (fresh) => {
+        for (const [id, reason] of expiredConnections) {
+          const connection = fresh.connections.find((c) => c.id === id);
+          if (connection) {
+            connection.status = "expired";
+            connection.lastRefreshError = reason;
+          }
+        }
+        if (fingerprint) fresh.actualCacheFingerprint = fingerprint;
+        fresh.actualAccountsCache = {
+          accounts: actualAccounts,
+          fetchedAt: new Date().toISOString(),
+          syncId: config.actual.syncId,
+        };
+      });
+
+      const latest = loadState(config);
+      dashboardData.connections = latest.connections.map((c) => ({
+        id: c.id,
+        label: c.label,
+        status: deriveStatus(c),
+        daysUntilExpiry: daysUntilExpiry(c),
+        lastRefreshAt: c.lastRefreshAt ?? null,
+        lastRefreshError: c.lastRefreshError ?? null,
+        accountCount: c.accounts.length,
+      }));
+
       dashboardData.overall = {
         accountSyncs: syncResult.accountSyncs,
         newTransactions: syncResult.newTransactions,
         balanceMismatches: syncResult.balanceMismatches,
         mismatchedBanks: syncResult.mismatchedBanks,
+        failures,
       };
 
       // Write dashboard outputs to disk
@@ -1103,21 +1199,30 @@ export const Sync = (config: AppConfig) => {
         if (!fs.existsSync(dashboardDir)) {
           fs.mkdirSync(dashboardDir, { recursive: true });
         }
-        
+
         const jsonPath = path.join(dashboardDir, "sync-summary.json");
         fs.writeFileSync(jsonPath, JSON.stringify(dashboardData, null, 2), "utf8");
         console.log(chalk.green(`\n📊 Raw dashboard JSON written to ${jsonPath}`));
-        
+
         const htmlPath = path.join(dashboardDir, "index.html");
         fs.writeFileSync(htmlPath, generateHtmlDashboard(dashboardData), "utf8");
-        console.log(chalk.green(`🖥️  Beautiful HTML dashboard written to ${htmlPath}`));
+        console.log(chalk.green(`🖥️  Dashboard written to ${htmlPath}`));
       } catch (err) {
         console.error(chalk.red("\n❌ Failed to write dashboard summary files:"), err);
       }
 
+      // Connections that still work but are close to lapsing — warn while
+      // there is still time to reconnect without a failed sync.
+      const expiringSoon = latest.connections.filter(
+        (c) => deriveStatus(c) === "expiring",
+      );
+
       if (config.ntfy) {
         console.log(chalk.blue("\n📱 Sending notification..."));
-        const hasIssues = syncResult.balanceMismatches > 0;
+        const hasIssues =
+          syncResult.balanceMismatches > 0 ||
+          failures.length > 0 ||
+          expiredConnections.size > 0;
         const title = hasIssues
           ? "Actual Sync - Issues Detected"
           : "Actual Sync Completed";
@@ -1130,10 +1235,35 @@ export const Sync = (config: AppConfig) => {
           `- Accounts synced: ${syncResult.accountSyncs}`,
           `- New transactions: ${syncResult.newTransactions}`,
           `- Balance mismatches: ${syncResult.balanceMismatches}`,
-          "",
-          hasIssues
-            ? `Balance mismatches detected in: ${syncResult.mismatchedBanks.join(", ")}`
-            : "All accounts synced successfully with matching balances!",
+          ...(failures.length
+            ? ["", `Failed: ${failures.map((f) => f.name).join(", ")}`]
+            : []),
+          ...(expiredConnections.size
+            ? [
+                "",
+                `Expired connections need reconnecting: ${[...expiredConnections.keys()]
+                  .map(
+                    (id) =>
+                      latest.connections.find((c) => c.id === id)?.label ?? id,
+                  )
+                  .join(", ")}`,
+              ]
+            : []),
+          ...(expiringSoon.length
+            ? [
+                "",
+                ...expiringSoon.map(
+                  (c) =>
+                    `Consent for ${c.label} expires in ${daysUntilExpiry(c)} days — reconnect it from the dashboard.`,
+                ),
+              ]
+            : []),
+          ...(syncResult.balanceMismatches > 0
+            ? ["", `Balance mismatches detected in: ${syncResult.mismatchedBanks.join(", ")}`]
+            : []),
+          ...(!hasIssues
+            ? ["", "All accounts synced successfully with matching balances!"]
+            : []),
         ].join("\n");
 
         try {
@@ -1146,6 +1276,23 @@ export const Sync = (config: AppConfig) => {
         } catch (error) {
           console.error(chalk.red("Failed to send notification:"), error);
         }
+      }
+
+      for (const connection of expiringSoon) {
+        console.log(
+          chalk.yellow(
+            `⚠️  Consent for "${connection.label}" expires in ${daysUntilExpiry(connection)} days — reconnect it from the dashboard.`,
+          ),
+        );
+      }
+
+      // Everything above is durable before we surface the failure, so a
+      // partial run still leaves a usable dashboard and up-to-date state.
+      if (failures.length > 0) {
+        throw new Error(
+          `${failures.length} of ${enabled.length} account(s) failed to sync:\n` +
+            failures.map((f) => `  - ${f.name}: ${f.reason}`).join("\n"),
+        );
       }
     } finally {
       await actual.shutdown();

@@ -10,7 +10,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ .Release.Name }}-configmap-reader
+  name: {{ .Release.Name }}-role
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: actual-sync
@@ -19,11 +19,27 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get", "list"]
+{{- if .Values.dashboard.enabled }}
+# The dashboard's "Run sync" button clones the CronJob into a one-off Job and
+# streams that pod's logs back to the browser.
+- apiGroups: ["batch"]
+  resources: ["cronjobs"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "create"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ .Release.Name }}-configmap-binding
+  name: {{ .Release.Name }}-rolebinding
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: actual-sync
@@ -34,5 +50,5 @@ subjects:
   namespace: {{ .Release.Namespace }}
 roleRef:
   kind: Role
-  name: {{ .Release.Name }}-configmap-reader
+  name: {{ .Release.Name }}-role
   apiGroup: rbac.authorization.k8s.io

@@ -2,10 +2,25 @@ import * as http from "http";
 import * as https from "https";
 import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "crypto";
 import { spawn } from "child_process";
 import chalk from "chalk";
 import { AppConfig } from "./config";
-import { generateHtmlDashboard } from "./sync";
+import { renderDashboardApp } from "./dashboard";
+import {
+  ReconcileReport,
+  completeConnection,
+  refreshAllAccounts,
+  removeConnection,
+} from "./connections";
+import {
+  Mapping,
+  daysUntilExpiry,
+  deriveStatus,
+  loadState,
+  updateState,
+} from "./state";
+import { buildAuthUrl, extractAuthCode } from "./truelayer";
 
 // Interface for Job Info
 interface JobInfo {
@@ -18,6 +33,28 @@ const localJobs = new Map<string, JobInfo>();
 
 // In-memory cache for K8s jobs
 const k8sJobLogsCache = new Map<string, JobInfo>();
+
+/** Path the server answers the TrueLayer redirect on. */
+const CALLBACK_PATH = "/api/truelayer/callback";
+
+/** An authorization run started in the browser and not yet completed. Lives
+ * only in memory — a restart mid-consent just means starting over. */
+type PendingAuth = {
+  id: string;
+  connectionId?: string;
+  createdAt: number;
+  status: "waiting" | "done" | "error";
+  report?: ReconcileReport;
+  error?: string;
+};
+const pendingAuths = new Map<string, PendingAuth>();
+const PENDING_TTL_MS = 15 * 60 * 1000;
+
+const prunePending = () => {
+  for (const [id, p] of pendingAuths) {
+    if (Date.now() - p.createdAt > PENDING_TTL_MS) pendingAuths.delete(id);
+  }
+};
 
 // Kubernetes config helper
 const getK8sConfig = () => {
@@ -91,22 +128,71 @@ const k8sRequest = (
   });
 };
 
+const readJsonBody = (req: http.IncomingMessage): Promise<any> =>
+  new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+      // Nothing this API accepts is large; refuse to buffer more.
+      if (raw.length > 1_000_000) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+    req.on("error", reject);
+    req.on("end", () => {
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error("Request body is not valid JSON"));
+      }
+    });
+  });
+
 export const startServer = (config: AppConfig, port: number = 8080) => {
   const k8s = getK8sConfig();
   const isK8s = k8s !== null;
   const cronjobName = process.env.ACTUAL_SYNC_CRONJOB_NAME || "actual-bank-sync";
   const dashboardDir = process.env.DASHBOARD_DATA_DIR || "/app/data";
+  const authToken = process.env.DASHBOARD_TOKEN;
+
+  // The server can complete the OAuth redirect itself only when the configured
+  // redirect URI actually points back at this callback. Otherwise the browser
+  // falls back to pasting the code, which works with TrueLayer's own redirect page.
+  const usesServerCallback = (() => {
+    try {
+      return new URL(config.truelayer.redirectUri).pathname.endsWith(
+        CALLBACK_PATH,
+      );
+    } catch {
+      return false;
+    }
+  })();
 
   console.log(
     chalk.cyan(
       `Booting actual-sync dashboard backend (Mode: ${isK8s ? "Kubernetes" : "Local"}, Port: ${port})`
     )
   );
+  console.log(
+    chalk.gray(
+      `Bank authorisation flow: ${usesServerCallback ? "server callback" : "paste the code"}`,
+    ),
+  );
+  if (!authToken) {
+    console.log(
+      chalk.yellow(
+        "No DASHBOARD_TOKEN set — the dashboard is unauthenticated. Set one before exposing it beyond localhost.",
+      ),
+    );
+  }
 
   const server = http.createServer(async (req, res) => {
-    // Enable CORS
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    // This API mutates state and sits next to bank credentials, so it is
+    // same-origin only rather than open to any site the browser visits.
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
     if (req.method === "OPTIONS") {
@@ -127,93 +213,28 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
       pathname = "/";
     }
 
-    // --- Serve static files ---
-    if (pathname === "/" || pathname === "/index.html") {
-      const summaryPath = path.join(dashboardDir, "sync-summary.json");
-      if (fs.existsSync(summaryPath)) {
-        try {
-          const summaryData = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
-          res.writeHead(200, { "Content-Type": "text/html" });
-          res.end(generateHtmlDashboard(summaryData));
-          return;
-        } catch (err: any) {
-          console.error("Failed to dynamically generate dashboard:", err);
-        }
-      }
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    const fail = (status: number, message: string) => json(status, { error: message });
 
-      const filePath = path.join(dashboardDir, "index.html");
-      if (fs.existsSync(filePath)) {
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(fs.readFileSync(filePath));
-      } else {
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(`
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>Actual Sync Dashboard</title>
-            <style>
-              body { background: #080c14; color: #f3f4f6; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-              .card { background: rgba(17, 24, 39, 0.6); padding: 2rem; border-radius: 16px; border: 1px solid rgba(255, 255, 255, 0.08); text-align: center; max-width: 450px; }
-              button { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 8px; font-weight: bold; cursor: pointer; margin-top: 1rem; }
-              button:hover { background: #2563eb; }
-              #console { display: none; margin-top: 1.5rem; background: black; padding: 1rem; border-radius: 8px; text-align: left; max-height: 200px; overflow-y: auto; font-family: monospace; white-space: pre-wrap; font-size: 0.85rem; }
-            </style>
-          </head>
-          <body>
-            <div class="card">
-              <h2>Dashboard Initializing</h2>
-              <p>The visual sync dashboard has not been generated yet because no sync has run.</p>
-              <button id="runBtn" onclick="runSync()">Run Initial Sync</button>
-              <div id="console"></div>
-            </div>
-            <script>
-              let basePath = window.location.pathname;
-              if (!basePath.endsWith('/')) basePath += '/';
-              async function runSync() {
-                const btn = document.getElementById('runBtn');
-                const consoleDiv = document.getElementById('console');
-                btn.disabled = true;
-                btn.innerText = 'Syncing...';
-                consoleDiv.style.display = 'block';
-                consoleDiv.innerText = 'Initializing sync run...\\n';
-                try {
-                  const res = await fetch(basePath + 'api/run', { method: 'POST' });
-                  const data = await res.json();
-                  if (data.job_id) {
-                    pollLogs(data.job_id);
-                  } else {
-                    consoleDiv.innerText += 'Error triggering sync: ' + (data.error || 'unknown');
-                    btn.disabled = false;
-                  }
-                } catch(e) {
-                  consoleDiv.innerText += 'Connection failed: ' + e.message;
-                  btn.disabled = false;
-                }
-              }
-              function pollLogs(jobId) {
-                const consoleDiv = document.getElementById('console');
-                const interval = setInterval(async () => {
-                  try {
-                    const res = await fetch(basePath + 'api/logs/' + jobId);
-                    const data = await res.json();
-                    if (data.logs) {
-                      consoleDiv.innerText = data.logs;
-                    }
-                    if (data.status === 'success' || data.status === 'failed') {
-                      clearInterval(interval);
-                      setTimeout(() => window.location.reload(), 2000);
-                    }
-                  } catch(e) {
-                    clearInterval(interval);
-                  }
-                }, 1500);
-              }
-            </script>
-          </body>
-          </html>
-        `);
+    // The callback arrives straight from the bank's redirect, so it carries no
+    // header we control and is authenticated by its unguessable state value.
+    if (authToken && pathname !== CALLBACK_PATH) {
+      const provided =
+        req.headers.authorization?.replace(/^Bearer\s+/i, "") ??
+        parsedUrl.searchParams.get("token") ??
+        "";
+      if (provided !== authToken) {
+        return fail(401, "Unauthorized — a valid dashboard token is required.");
       }
+    }
+
+    // --- Serve the app ---
+    if (pathname === "/" || pathname === "/index.html") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(renderDashboardApp());
       return;
     }
 
@@ -223,15 +244,241 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(fs.readFileSync(filePath));
       } else {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Sync summary not found" }));
+        return fail(404, "Sync summary not found");
       }
       return;
     }
 
-    // --- API Endpoints ---
+    // --- Configuration & mapping API ---
+    if (pathname === "/api/state" && req.method === "GET") {
+      try {
+        const state = loadState(config);
+        return json(200, {
+          flow: usesServerCallback ? "callback" : "paste",
+          connections: state.connections.map((c) => ({
+            id: c.id,
+            label: c.label,
+            status: deriveStatus(c),
+            daysUntilExpiry: daysUntilExpiry(c),
+            connectedAt: c.connectedAt,
+            lastRefreshAt: c.lastRefreshAt ?? null,
+            lastRefreshError: c.lastRefreshError ?? null,
+            accountCount: c.accounts.length,
+            accounts: c.accounts.map((a) => ({
+              id: a.id,
+              name: a.name,
+              type: a.type,
+            })),
+          })),
+          mappings: state.map,
+          actualAccounts: state.actualAccountsCache?.accounts ?? [],
+          actualAccountsFetchedAt: state.actualAccountsCache?.fetchedAt ?? null,
+        });
+      } catch (err: any) {
+        return fail(500, err.message);
+      }
+    }
+
+    if (pathname === "/api/mappings" && req.method === "PUT") {
+      try {
+        const body = await readJsonBody(req);
+        const incoming: Mapping[] = Array.isArray(body?.mappings)
+          ? body.mappings
+          : [];
+
+        const state = loadState(config);
+        const known = new Set(state.connections.map((c) => c.id));
+        const cleaned: Mapping[] = [];
+        for (const m of incoming) {
+          if (!m?.name || !m?.truelayerAccountId || !m?.actualAccountId) {
+            return fail(
+              400,
+              "Every mapping needs a name, a bank account and an Actual account.",
+            );
+          }
+          if (!known.has(m.connectionId)) {
+            return fail(
+              400,
+              `Mapping "${m.name}" refers to a bank connection that no longer exists.`,
+            );
+          }
+          cleaned.push({
+            id: m.id || randomUUID(),
+            name: String(m.name).trim(),
+            connectionId: m.connectionId,
+            truelayerAccountId: m.truelayerAccountId,
+            actualAccountId: m.actualAccountId,
+            mapConfig: { invertAmount: Boolean(m.mapConfig?.invertAmount) },
+            enabled: m.enabled !== false,
+          });
+        }
+
+        await updateState(config, (fresh) => {
+          fresh.map = cleaned;
+        });
+        return json(200, { ok: true, count: cleaned.length });
+      } catch (err: any) {
+        return fail(400, err.message);
+      }
+    }
+
+    if (pathname.startsWith("/api/connections/") && req.method === "DELETE") {
+      const id = decodeURIComponent(pathname.substring("/api/connections/".length));
+      try {
+        const result = await removeConnection(config, id);
+        return json(200, { ok: true, ...result });
+      } catch (err: any) {
+        return fail(500, err.message);
+      }
+    }
+
+    if (pathname === "/api/accounts/refresh" && req.method === "POST") {
+      try {
+        const reports = await refreshAllAccounts(config);
+
+        // Refreshing the Actual side needs a full budget download, so it is
+        // done here on demand rather than on every dashboard load.
+        let actualAccounts: { id: string; name: string }[] = [];
+        try {
+          const { alignApiDependency } = await import("./align");
+          await alignApiDependency(config);
+          const { openActualSession } = await import("./actual");
+          const state = loadState(config);
+          const session = await openActualSession(config.actual, {
+            ...(state.actualCacheFingerprint
+              ? { previousFingerprint: state.actualCacheFingerprint }
+              : {}),
+            onFingerprint: (fp) => {
+              void updateState(config, (fresh) => {
+                fresh.actualCacheFingerprint = fp;
+              });
+            },
+          });
+          try {
+            actualAccounts = await session.listAccounts();
+          } finally {
+            await session.shutdown();
+          }
+          await updateState(config, (fresh) => {
+            fresh.actualAccountsCache = {
+              accounts: actualAccounts,
+              fetchedAt: new Date().toISOString(),
+              syncId: config.actual.syncId,
+            };
+          });
+        } catch (err: any) {
+          return json(200, {
+            ok: true,
+            reports,
+            actualError: `Bank accounts refreshed, but Actual could not be reached: ${err.message}`,
+          });
+        }
+
+        return json(200, { ok: true, reports, actualAccounts });
+      } catch (err: any) {
+        return fail(500, err.message);
+      }
+    }
+
+    // --- Bank authorisation ---
+    if (pathname === "/api/truelayer/auth-url" && req.method === "GET") {
+      prunePending();
+      const connectionId = parsedUrl.searchParams.get("connectionId") ?? undefined;
+      const pending: PendingAuth = {
+        id: randomUUID(),
+        ...(connectionId ? { connectionId } : {}),
+        createdAt: Date.now(),
+        status: "waiting",
+      };
+      pendingAuths.set(pending.id, pending);
+      return json(200, {
+        url: buildAuthUrl(
+          config.truelayer,
+          usesServerCallback ? pending.id : undefined,
+        ),
+        pending: pending.id,
+        flow: usesServerCallback ? "callback" : "paste",
+      });
+    }
+
+    if (pathname === CALLBACK_PATH && req.method === "GET") {
+      const code = parsedUrl.searchParams.get("code");
+      const stateParam = parsedUrl.searchParams.get("state") ?? "";
+      const pending = pendingAuths.get(stateParam);
+      const finish = (message: string, ok: boolean) => {
+        res.writeHead(ok ? 200 : 400, { "Content-Type": "text/html" });
+        res.end(
+          `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Actual Sync</title></head>` +
+            `<body style="background:#080c14;color:#f3f4f6;font-family:system-ui,sans-serif;display:flex;` +
+            `align-items:center;justify-content:center;height:100vh;margin:0;text-align:center">` +
+            `<div><h2>${message}</h2><p style="color:#9ca3af">You can close this tab and return to the dashboard.</p></div>` +
+            `</body></html>`,
+        );
+      };
+
+      if (!pending) {
+        return finish("This authorisation link has expired. Start again from the dashboard.", false);
+      }
+      if (!code) {
+        const reason =
+          parsedUrl.searchParams.get("error_description") ??
+          parsedUrl.searchParams.get("error") ??
+          "The bank did not return an authorization code.";
+        pending.status = "error";
+        pending.error = reason;
+        return finish(reason, false);
+      }
+
+      try {
+        const { report } = await completeConnection(config, {
+          code,
+          ...(pending.connectionId ? { connectionId: pending.connectionId } : {}),
+        });
+        pending.status = "done";
+        pending.report = report;
+        return finish("Bank connected.", true);
+      } catch (err: any) {
+        pending.status = "error";
+        pending.error = err.message;
+        return finish(`Could not complete the connection: ${err.message}`, false);
+      }
+    }
+
+    if (pathname.startsWith("/api/truelayer/pending/") && req.method === "GET") {
+      const id = decodeURIComponent(
+        pathname.substring("/api/truelayer/pending/".length),
+      );
+      const pending = pendingAuths.get(id);
+      if (!pending) return fail(404, "That authorisation has expired.");
+      if (pending.status === "done") {
+        pendingAuths.delete(id);
+        return json(200, { status: "done", report: pending.report });
+      }
+      if (pending.status === "error") {
+        pendingAuths.delete(id);
+        return json(200, { status: "error", error: pending.error });
+      }
+      return json(200, { status: "waiting" });
+    }
+
+    if (pathname === "/api/truelayer/exchange" && req.method === "POST") {
+      try {
+        const body = await readJsonBody(req);
+        const code = extractAuthCode(String(body?.code ?? ""));
+        if (!code) return fail(400, "No authorization code was provided.");
+        const result = await completeConnection(config, {
+          code,
+          ...(body?.connectionId ? { connectionId: body.connectionId } : {}),
+          ...(body?.label ? { label: body.label } : {}),
+        });
+        return json(200, { ok: true, ...result });
+      } catch (err: any) {
+        return fail(400, err.message);
+      }
+    }
+
+    // --- Sync execution ---
     if (pathname === "/api/status" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
       if (isK8s) {
         try {
           // Verify we can read the CronJob
@@ -240,36 +487,28 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
             "GET",
             `/apis/batch/v1/namespaces/${k8s.namespace}/cronjobs/${cronjobName}`
           );
-          res.end(
-            JSON.stringify({
-              enabled: true,
-              mode: "Kubernetes",
-              cronjob: cronjobName,
-              namespace: k8s.namespace,
-            })
-          );
-        } catch (err: any) {
-          res.end(
-            JSON.stringify({
-              enabled: false,
-              mode: "Kubernetes",
-              cronjob: cronjobName,
-              namespace: k8s.namespace,
-              error: err.message,
-            })
-          );
-        }
-      } else {
-        res.end(
-          JSON.stringify({
+          return json(200, {
             enabled: true,
-            mode: "Local",
+            mode: "Kubernetes",
             cronjob: cronjobName,
-            namespace: "default",
-          })
-        );
+            namespace: k8s.namespace,
+          });
+        } catch (err: any) {
+          return json(200, {
+            enabled: false,
+            mode: "Kubernetes",
+            cronjob: cronjobName,
+            namespace: k8s.namespace,
+            error: err.message,
+          });
+        }
       }
-      return;
+      return json(200, {
+        enabled: true,
+        mode: "Local",
+        cronjob: cronjobName,
+        namespace: "default",
+      });
     }
 
     if (pathname === "/api/run" && req.method === "POST") {
@@ -322,79 +561,68 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
             jobManifest
           );
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, job_id: jobId, mode: "Kubernetes" }));
+          return json(200, { success: true, job_id: jobId, mode: "Kubernetes" });
         } catch (err: any) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: `Failed to trigger K8s job: ${err.message}` }));
-        }
-      } else {
-        // Local Mode: Spawns the CLI as a subprocess
-        const jobId = `${cronjobName}-manual-${Math.random().toString(36).substring(2, 8)}`;
-        localJobs.set(jobId, { status: "pending", logs: "Initializing local process...\n" });
-
-        try {
-          const mainFile = process.argv[1];
-          const cp = spawn(process.argv[0], [mainFile, "sync"], {
-            env: { ...process.env, DASHBOARD_DATA_DIR: dashboardDir },
-          });
-
-          localJobs.set(jobId, {
-            status: "running",
-            logs: `Starting local actual-sync-minimal process (${jobId})...\n----------------------------------------------------------\n`,
-          });
-
-          cp.stdout.on("data", (data) => {
-            const job = localJobs.get(jobId);
-            if (job) {
-              job.logs = (job.logs + data.toString()).slice(-100000); // Keep last 100k chars
-              localJobs.set(jobId, job);
-            }
-          });
-
-          cp.stderr.on("data", (data) => {
-            const job = localJobs.get(jobId);
-            if (job) {
-              job.logs = (job.logs + data.toString()).slice(-100000);
-              localJobs.set(jobId, job);
-            }
-          });
-
-          cp.on("close", (code) => {
-            const job = localJobs.get(jobId);
-            if (job) {
-              job.status = code === 0 ? "success" : "failed";
-              job.logs += `\n----------------------------------------------------------\nProcess exited with code ${code}.\n`;
-              localJobs.set(jobId, job);
-            }
-          });
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, job_id: jobId, mode: "Local" }));
-        } catch (err: any) {
-          localJobs.set(jobId, { status: "failed", logs: `Process spawn failed: ${err.message}` });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: `Failed to trigger local sync: ${err.message}` }));
+          return fail(500, `Failed to trigger K8s job: ${err.message}`);
         }
       }
-      return;
+
+      // Local Mode: Spawns the CLI as a subprocess
+      const jobId = `${cronjobName}-manual-${Math.random().toString(36).substring(2, 8)}`;
+      localJobs.set(jobId, { status: "pending", logs: "Initializing local process...\n" });
+
+      const mainFile = process.argv[1];
+      if (!mainFile) {
+        localJobs.set(jobId, { status: "failed", logs: "Cannot locate the actual-sync entry point." });
+        return fail(500, "Cannot locate the actual-sync entry point.");
+      }
+
+      try {
+        const cp = spawn(process.execPath, [mainFile, "sync"], {
+          env: { ...process.env, DASHBOARD_DATA_DIR: dashboardDir },
+        });
+
+        localJobs.set(jobId, {
+          status: "running",
+          logs: `Starting local actual-sync-minimal process (${jobId})...\n----------------------------------------------------------\n`,
+        });
+
+        const append = (data: Buffer) => {
+          const job = localJobs.get(jobId);
+          if (job) {
+            job.logs = (job.logs + data.toString()).slice(-100000); // Keep last 100k chars
+            localJobs.set(jobId, job);
+          }
+        };
+        cp.stdout.on("data", append);
+        cp.stderr.on("data", append);
+
+        cp.on("close", (code) => {
+          const job = localJobs.get(jobId);
+          if (job) {
+            job.status = code === 0 ? "success" : "failed";
+            job.logs += `\n----------------------------------------------------------\nProcess exited with code ${code}.\n`;
+            localJobs.set(jobId, job);
+          }
+        });
+
+        return json(200, { success: true, job_id: jobId, mode: "Local" });
+      } catch (err: any) {
+        localJobs.set(jobId, { status: "failed", logs: `Process spawn failed: ${err.message}` });
+        return fail(500, `Failed to trigger local sync: ${err.message}`);
+      }
     }
 
     if (pathname.startsWith("/api/logs/") && req.method === "GET") {
       const jobId = pathname.substring("/api/logs/".length);
       if (!jobId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing job ID" }));
-        return;
+        return fail(400, "Missing job ID");
       }
 
       if (isK8s) {
         // K8s Log Retrieval
         if (k8sJobLogsCache.has(jobId)) {
-          const cached = k8sJobLogsCache.get(jobId)!;
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(cached));
-          return;
+          return json(200, k8sJobLogsCache.get(jobId)!);
         }
 
         try {
@@ -419,18 +647,13 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
             if (jobFailed) {
               const result: JobInfo = { status: "failed", logs: "Job failed. Pod was deleted before logs could be read." };
               k8sJobLogsCache.set(jobId, result);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify(result));
+              return json(200, result);
             } else if (jobSuccess) {
               const result: JobInfo = { status: "success", logs: "Job completed successfully." };
               k8sJobLogsCache.set(jobId, result);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify(result));
-            } else {
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "pending", logs: "Job queued. Waiting for pod..." }));
+              return json(200, result);
             }
-            return;
+            return json(200, { status: "pending", logs: "Job queued. Waiting for pod..." });
           }
 
           const pod = podList.items[0];
@@ -438,9 +661,7 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
           const phase = pod.status.phase;
 
           if (phase === "Pending") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "pending", logs: "Pod starting up (Pending)..." }));
-            return;
+            return json(200, { status: "pending", logs: "Pod starting up (Pending)..." });
           }
 
           // Fetch pod logs
@@ -467,31 +688,28 @@ export const startServer = (config: AppConfig, port: number = 8080) => {
             k8sJobLogsCache.set(jobId, responseObj);
           }
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(responseObj));
+          return json(200, responseObj);
         } catch (err: any) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: `Failed to fetch K8s logs: ${err.message}` }));
-        }
-      } else {
-        // Local Log Retrieval
-        if (localJobs.has(jobId)) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(localJobs.get(jobId)));
-        } else {
-          res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Job ID not found" }));
+          return fail(500, `Failed to fetch K8s logs: ${err.message}`);
         }
       }
-      return;
+
+      // Local Log Retrieval
+      const job = localJobs.get(jobId);
+      if (job) return json(200, job);
+      return fail(404, "Job ID not found");
     }
 
     // --- Not Found ---
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Path not found" }));
+    return fail(404, "Path not found");
   });
 
   server.listen(port, "0.0.0.0", () => {
     console.log(chalk.green(`Server running at http://0.0.0.0:${port}/`));
+    if (usesServerCallback) {
+      console.log(
+        chalk.gray(`TrueLayer redirects are handled at ${config.truelayer.redirectUri}`),
+      );
+    }
   });
 };

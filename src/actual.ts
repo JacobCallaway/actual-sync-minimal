@@ -1,5 +1,7 @@
 import * as api from "@actual-app/api";
-import { mkdir } from "fs/promises";
+import { mkdir, rm } from "fs/promises";
+import { createHash } from "crypto";
+import chalk from "chalk";
 
 export type ActualConfig = {
   syncId: string;
@@ -39,11 +41,36 @@ const normalizeUrl = (url: string): string => {
   return `http://${url}`;
 };
 
+/** Identifies which server and budget the local cache directory was built for. */
+export const cacheFingerprint = (config: ActualConfig): string =>
+  createHash("sha256")
+    .update(`${normalizeUrl(config.url)}|${config.syncId}`)
+    .digest("hex")
+    .slice(0, 16);
+
 /** Open a session to the Actual Budget API.
  * The session initialises and downloads the budget once.
  * Call `shutdown()` when done to sync and close the budget. */
-export const openActualSession = async (config: ActualConfig) => {
+export const openActualSession = async (
+  config: ActualConfig,
+  opts: { onFingerprint?: (fingerprint: string) => void; previousFingerprint?: string } = {},
+) => {
   const serverURL = normalizeUrl(config.url);
+  const fingerprint = cacheFingerprint(config);
+
+  // The cache directory holds a budget downloaded for one server+budget pair.
+  // Pointing the config at a different one leaves that cache stale, which
+  // surfaces later as a confusing failure inside downloadBudget. Clear it here
+  // instead, where we can say why.
+  if (opts.previousFingerprint && opts.previousFingerprint !== fingerprint) {
+    console.log(
+      chalk.yellow(
+        `Actual server or budget changed since the last run — clearing the stale cache at ${config.cacheDir}`,
+      ),
+    );
+    await rm(config.cacheDir, { recursive: true, force: true });
+  }
+
   await mkdir(config.cacheDir, { recursive: true });
   try {
     await api.init({
@@ -58,6 +85,7 @@ export const openActualSession = async (config: ActualConfig) => {
     );
   }
   await api.downloadBudget(config.syncId);
+  opts.onFingerprint?.(fingerprint);
 
   const listAccounts = async () => {
     const accounts = await api.getAccounts();

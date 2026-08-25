@@ -21,6 +21,36 @@ resources:
     memory: 256Mi
     cpu: 200m
 
+# Shared volume for connections, tokens, the account mapping and the sync
+# summary. The CronJob and the dashboard both mount it — the ConfigMap is
+# mounted read-only and cannot hold state the dashboard needs to write.
+persistence:
+  enabled: true
+  size: 1Gi
+  accessMode: ReadWriteOnce
+  mountPath: /app/data
+  # storageClass: ""
+
+# Web dashboard for managing bank connections and account mapping.
+dashboard:
+  enabled: true
+  port: 8080
+  service:
+    type: ClusterIP
+    port: 80
+  # Shared secret required to use the dashboard. Strongly recommended before
+  # exposing it beyond the cluster: create a Secret and name it here.
+  #   kubectl create secret generic actual-sync-dashboard --from-literal=token="$(openssl rand -hex 32)"
+  existingSecret: ""
+  existingSecretKey: token
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 50m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
 config:
   create: true
   data: |
@@ -30,9 +60,15 @@ config:
       url: https://your-actual-server.com
       cacheDir: /tmp/.cache/
     truelayer:
+      # Leave as-is to paste the code into the dashboard. To let the dashboard
+      # complete the redirect itself, set this to the dashboard's public URL
+      # ending in /api/truelayer/callback and register it in the TrueLayer
+      # console.
       redirectUri: https://console.truelayer.com/redirect-page
       clientId: your-truelayer-client-id
       clientSecret: your-truelayer-client-secret
+      # Bank connections and the account mapping are managed from the
+      # dashboard and stored on the data volume, not here.
       accounts: []
     sync:
       map: []

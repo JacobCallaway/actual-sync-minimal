@@ -34,10 +34,18 @@ spec:
               value: "/config/.config.yml"
             - name: TZ
               value: {{ .Values.cronjob.timeZone | quote }}
+            # Connections, tokens and the account mapping live here, shared
+            # with the dashboard. The ConfigMap stays read-only bootstrap.
+            - name: STATE_DIR
+              value: {{ .Values.persistence.mountPath | quote }}
+            - name: DASHBOARD_DATA_DIR
+              value: {{ .Values.persistence.mountPath | quote }}
             volumeMounts:
             - name: config
               mountPath: /config
               readOnly: true
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
             - name: cache
               mountPath: /tmp/.cache
             resources:
@@ -56,5 +64,12 @@ spec:
               name: {{ .Release.Name }}-config
               {{- end }}
               defaultMode: 0644
+          - name: data
+            {{- if .Values.persistence.enabled }}
+            persistentVolumeClaim:
+              claimName: {{ .Release.Name }}-data
+            {{- else }}
+            emptyDir: {}
+            {{- end }}
           - name: cache
             emptyDir: {}
