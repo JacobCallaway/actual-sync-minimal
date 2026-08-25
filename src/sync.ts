@@ -63,9 +63,9 @@ export const generateHtmlDashboard = (data: any): string => {
               <span class="detail-label">Updated</span>
               <span class="detail-val val-updated">${acc.updated}</span>
             </div>
-            <div class="detail-item">
-              <span class="detail-label">Preview</span>
-              <span class="detail-val ${acc.updatedPreview > 0 ? "val-preview" : "val-zero"}">${acc.updatedPreview}</span>
+            <div class="detail-item" title="Incoming transactions that matched one already in Actual. A high number here is normal — it is deduplication working, not a backlog.">
+              <span class="detail-label">Matched</span>
+              <span class="detail-val val-zero">${acc.updatedPreview}</span>
             </div>
             <div class="detail-item">
               <span class="detail-label">Errors</span>
@@ -307,9 +307,6 @@ export const generateHtmlDashboard = (data: any): string => {
     .val-updated {
       color: var(--accent-primary);
     }
-    .val-preview {
-      color: #a855f7;
-    }
     .val-zero {
       color: var(--text-muted);
     }
@@ -460,9 +457,6 @@ export const generateHtmlDashboard = (data: any): string => {
     }
     .tx-updated {
       color: var(--accent-primary);
-    }
-    .tx-preview {
-      color: #a855f7;
     }
     .tx-error {
       color: var(--accent-error);
@@ -684,7 +678,7 @@ export const generateHtmlDashboard = (data: any): string => {
             <th>Online / Actual</th>
             <th style="text-align: right;">Add</th>
             <th style="text-align: right;">Upd</th>
-            <th style="text-align: right;">Prv</th>
+            <th style="text-align: right;" title="Matched an already-imported transaction">Mch</th>
             <th style="text-align: right;">Err</th>
           </tr>
         </thead>
@@ -765,7 +759,7 @@ export const generateHtmlDashboard = (data: any): string => {
               </td>
               <td class="tx-amount tx-credit">\${run.added}</td>
               <td class="tx-amount tx-updated">\${run.updated}</td>
-              <td class="tx-amount tx-preview">\${run.updatedPreview}</td>
+              <td class="tx-amount tx-zero" title="Transactions matched to ones already imported">\${run.updatedPreview}</td>
               <td class="tx-amount \${run.errors > 0 ? 'tx-error' : 'tx-zero'}">\${run.errors}</td>
             </tr>
           \`;
